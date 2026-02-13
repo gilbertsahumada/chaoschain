@@ -31,6 +31,20 @@ import {Scoring} from "./libraries/Scoring.sol";
  * @author ChaosChain
  */
 contract RewardsDistributor is Ownable, IRewardsDistributor {
+    // ============ ChaosSettler Resolution State ============
+
+    /// @dev Authorized external resolvers (e.g., CRE DON address)
+    mapping(address => bool) public authorizedResolvers;
+    /// @dev Emitted when a resolver is authorized/deauthorized
+    event ResolverUpdated(address indexed resolver, bool authorised);
+    /// @dev Emitted when a market resolution is completed via resolveAndDistribute
+    event ResolutionCompleted(
+        address indexed studio,
+        uint256 indexed epoch,
+        bool resolution,
+        uint256 totalDistribyted,
+        uint256 workerCount
+    );
     
     // ============ Constants ============
     
@@ -1141,6 +1155,205 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
             names = new string[](0);
             weights = new uint16[](0);
         }
+    }
+
+    /// @dev Allow owner or authorized resolvers (CRE DON)
+    modifier onlyOwnerResolver() {
+        require(msg.sender == owner() || authorizedResolvers[msg.sender],
+        "Not authorised resolver"
+        );
+        _;
+    }
+    /**
+     * @notice Authorize or deauthorize an external resolver (e.g., CRE DON)
+     * @param resolver The resolver address
+     * @param authorized True to authorize, false to revoke
+     */
+    function setAuthorizedResolver(address resolver, bool authorized) external onlyOwner {
+        require(resolver != address(0), "Invalid Resolver");
+        authorizedResolvers[resolver] = authorized;
+        emit ResolverUpdated(resolver, authorized);
+    }
+
+    /**
+     * @notice Resolve a prediction market and distribute rewards
+     * @dev Called by CRE DON after off-chain oracle evaluation
+     * @dev TODO: I know 2 loops are not optimal, due hackathon purpose
+     * I'll keep up to 10 agents, gotta work to convert this to O(1) instead of O(N)
+     * IF POSSIBLE BTW
+     * Flow:
+     * 1. Validate inputs and authorization
+     * 2. Calculate reward pool (totalEscrow - sum of stakes)
+     * 3. Compute weighted rewards: quality × correctnessMult × reputation
+     * 4. Release funds (rewards + stake returns) via StudioProxy.releaseFunds
+     * 5. Publish reputation via ReputationRegistry.giveFeedback
+     * 6. Track epoch work
+     *
+     * @param studio The StudioProxy address
+     * @param epoch The epoch number for tracking
+     * @param workers Array of worker addresses (oracles who participated)
+     * @param qualityScores Quality scores 0-100 per worker (from LLM evaluation)
+     * @param determinations What each oracle determined (true/false)
+     * @param resolution The final weighted resolution (true/false)
+     */
+    function resolveAndDistribute(
+        address studio,
+        uint64 epoch,
+        address[] calldata workers,
+        uint8[] calldata qualityScores,
+        bool[] calldata determinations,
+        bool resolution
+    ) external onlyOwnerResolver {
+        // --- Validations ---
+        require(studio != address(0), "Invalid Studio");
+        require(workers.length > 0, "No workers");
+        require(workers.length <=  10, "Too many workers");
+        require(
+            workers.length == qualityScores.length &&
+            workers.length == determinations.length,
+            "Array length mismatch"
+        );
+
+        StudioProxy studioProxy = StudioProxy(payable(studio));
+
+        // --- Calculate reward pool ---
+        uint256 totalEscrow = studioProxy.getTotalEscrow();
+        uint256 totalStakes = 0;
+        for(uint256 i = 0; i < workers.length; i++) {
+            uint256 agentId = studioProxy.getAgentId(workers[i]);
+            require(agentId != 0, "Worker not registered");
+            totalStakes += studioProxy.getAgentStake(agentId);
+        }
+
+        require(totalEscrow > totalStakes, "No reward pool");
+        uint256 rewardPool = totalEscrow - totalStakes;
+
+        // --- Calculated weighted rewards ---
+        uint256[] memory weights = new uint256[](workers.length);
+        uint256 totalWeight = 0;
+
+        for (uint256 i = 0; i < workers.length; i++) {
+            // Correctness multiplier: accurate oracles get 200, inaccurate get 50
+            uint256 correctnessMult = (determinations[i] == resolution) ? 200 : 50;
+
+            // Get reputation (defaults to 50 if none)
+            uint256 agentId = studioProxy.getAgentId(workers[i]);
+            uint256 rep = _getReputation(agentId);
+
+            // weight = quality x correcnessMult x reputation
+            weights[i] = uint256(qualityScores[i] * correctnessMult * rep);
+            totalWeight += weights[i];
+        }
+
+        require(totalWeight > 0, "Zero total weight");
+
+        // --- Dsitribute rewards + return stakes ---
+        uint256 totalDistributed = 0;
+        bytes32 resolutionHash = keccak256(
+            abi.encodePacked(studio, epoch, resolution, block.timestamp)
+        );
+
+        for (uint i = 0; i < workers.length; i++) {
+            uint256 agentId = studioProxy.getAgentId(workers[i]);
+
+            // Calculate proportional reward
+            uint256 reward = (rewardPool * weights[i]) / totalWeight;
+            uint256 stake = studioProxy.getAgentStake(agentId);
+
+            // Release reward
+            if(reward > 0) {
+                studioProxy.releaseFunds(workers[i], reward, resolutionHash);
+                totalDistributed += reward;
+            }
+
+            // Return Stake
+            if(stake > 0) {
+                studioProxy.releaseFunds(workers[i], stake, resolutionHash);
+            }
+
+            // Publish reputation feedback
+            _publishResolutionReputation(
+                agentId,
+                qualityScores[i],
+                determinations[i] == resolution
+            );
+        }
+
+        // Track epoch work
+        _epochWork[studio][epoch].push(resolutionHash);
+
+        emit ResolutionCompleted(studio, epoch, resolution, totalDistributed, workers.length);
+
+    }
+
+    /**
+     * @notice Get agent reputation score, defaulting to 50 if none exists
+     * @param agentId The agent ID
+     * @return reputation Score 0-100 (50 = neutral default)
+     */
+    function _getReputation(uint256 agentId) internal view returns(uint256) {
+        address reputationRegistryAddrr = registry.getReputationRegistry();
+        if(reputationRegistryAddrr == address(0)) return 50; // TODO: Improve this number calculation
+
+        uint256 size;
+        assembly {
+            size := extcodesize(reputationRegistryAddrr)
+        }
+
+        if(size == 0) return 50;
+
+        // Query reputation: filter by this contract as clientAddress
+        address[] memory clients = new address[](1);
+        clients[0] = address(this);
+
+        try IERC8004Reputation(reputationRegistryAddrr).getSummary(
+            agentId,
+            clients,
+            "RESOLUTION_QUALITY",
+            ""
+        ) returns (uint64 count, int128 summaryValue, uint8 /* decimals */) {
+            if(count == 0) return 50; // No history -> neutral
+            if(summaryValue < 0) return 10; // Negative rep -> minimum
+            if(summaryValue > 100) return 100; // Cap at 100
+            return uint256(uint128(summaryValue));
+        } catch {
+            return 50; // Fallback -> neutral
+        }
+    }
+
+    /**
+     * @notice Publish resolution quality reputation for a worker oracle
+     * @param agentId The agent's ERC-8004 identity ID
+     * @param qualityScore Quality score 0-100
+     * @param wasAccurate Whether the oracle's determination matched resolution
+     */
+    function _publishResolutionReputation(
+        uint256 agentId,
+        uint8 qualityScore,
+        bool wasAccurate
+    ) internal {
+        address reputationRegistryAddr = registry.getReputationRegistry();
+        if(reputationRegistryAddr == address(0)) return;
+
+        uint256 size;
+        assembly {
+            size := extcodesize(reputationRegistryAddr)
+        }
+
+        if(size == 0) return;
+
+        string memory accuracyTag = wasAccurate ? "ACCURATE" : "INNACURATE";
+
+        try IERC8004Reputation(reputationRegistryAddr).giveFeedback(
+            agentId,
+            int128(uint128(qualityScore)),
+            0, // valueDecimals = 0
+            "RESOLUTION_QUALITY", // tag1: dimension
+            accuracyTag, // tag2: accuracy indicator
+            "", // endpoint
+            "", // feedbackURI
+            bytes32(0) // feedbackHash
+        ) {} catch {}
     }
     
     // NOTE: _stringToBytes32 REMOVED in ERC-8004 Jan 2026 update
