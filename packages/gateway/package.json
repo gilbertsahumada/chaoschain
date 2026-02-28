@@ -20,10 +20,13 @@
     "smoke-test": "tsx scripts/smoke-test.ts"
   },
   "dependencies": {
+    "@ardrive/turbo-sdk": "^1.41.0",
+    "@xmtp/node-sdk": "^5.3.0",
     "dotenv": "^17.2.3",
     "ethers": "^6.10.0",
     "express": "^4.18.2",
     "pg": "^8.11.0",
+    "prom-client": "^15.1.3",
     "uuid": "^9.0.0"
   },
   "devDependencies": {

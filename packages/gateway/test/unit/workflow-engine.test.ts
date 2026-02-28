@@ -89,12 +89,25 @@ function createTestInput(): WorkSubmissionInput {
     epoch: 1,
     agent_address: '0xAgent',
     data_hash: '0xDataHash',
-    thread_root: '0xThreadRoot',
-    evidence_root: '0xEvidenceRoot',
+    dkg_evidence: [{
+      arweave_tx_id: 'test-tx-1',
+      author: '0xAgent',
+      timestamp: 1000,
+      parent_ids: [],
+      payload_hash: '0x' + '00'.repeat(32),
+      artifact_ids: [],
+      signature: '0x' + '00'.repeat(65),
+    }],
     evidence_content: Buffer.from('test evidence'),
     signer_address: '0xSigner',
   };
 }
+
+const MOCK_DKG_PROGRESS = {
+  dkg_thread_root: '0x' + 'aa'.repeat(32),
+  dkg_evidence_root: '0x' + 'bb'.repeat(32),
+  dkg_weights: { '0xAgent': 1.0 },
+};
 
 // =============================================================================
 // A. RECONCILIATION-BEFORE-IRREVERSIBLE TESTS
@@ -146,6 +159,7 @@ describe('A. Reconciliation-before-irreversible', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
     };
@@ -174,6 +188,7 @@ describe('A. Reconciliation-before-irreversible', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
     };
@@ -201,6 +216,7 @@ describe('A. Reconciliation-before-irreversible', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'AWAIT_TX_CONFIRM';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xExistingTx',
@@ -279,6 +295,7 @@ describe('B. Crash recovery simulation', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'AWAIT_TX_CONFIRM';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xCrashedTx',
@@ -307,7 +324,7 @@ describe('B. Crash recovery simulation', () => {
     const workflow = createWorkSubmissionWorkflow(input);
     workflow.state = 'RUNNING';
     workflow.step = 'UPLOAD_EVIDENCE';
-    workflow.progress = {}; // No arweave tx id
+    workflow.progress = { ...MOCK_DKG_PROGRESS }; // DKG done, no arweave tx id
 
     await persistence.create(workflow);
 
@@ -332,12 +349,13 @@ describe('B. Crash recovery simulation', () => {
     const workflow1 = createWorkSubmissionWorkflow(input1);
     workflow1.state = 'RUNNING';
     workflow1.step = 'UPLOAD_EVIDENCE';
+    workflow1.progress = { ...MOCK_DKG_PROGRESS };
 
     const input2 = { ...createTestInput(), agent_address: '0xAgent2' };
     const workflow2 = createWorkSubmissionWorkflow(input2);
     workflow2.state = 'STALLED';
     workflow2.step = 'AWAIT_ARWEAVE_CONFIRM';
-    workflow2.progress = { arweave_tx_id: 'ar-tx-2' };
+    workflow2.progress = { ...MOCK_DKG_PROGRESS, arweave_tx_id: 'ar-tx-2' };
 
     await persistence.create(workflow1);
     await persistence.create(workflow2);
@@ -420,6 +438,7 @@ describe('C. FAILED vs STALLED separation', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
     };
@@ -443,6 +462,7 @@ describe('C. FAILED vs STALLED separation', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
     };
@@ -466,6 +486,7 @@ describe('C. FAILED vs STALLED separation', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
     };
@@ -701,6 +722,7 @@ describe('Idempotency invariants', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'UPLOAD_EVIDENCE';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'already-uploaded', // Already uploaded
     };
 
@@ -719,6 +741,7 @@ describe('Idempotency invariants', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx',
       arweave_confirmed: true,
       onchain_tx_hash: 'already-submitted', // Already submitted to StudioProxy
@@ -797,6 +820,7 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'REGISTER_WORK';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xStudioTx',
@@ -833,6 +857,7 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'REGISTER_WORK';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xStudioTx',
@@ -862,9 +887,9 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'SUBMIT_WORK_ONCHAIN'; // About to submit to StudioProxy
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
-      // No onchain_tx_hash - will be set by reconciliation advancing
     };
 
     await persistence.create(workflow);
@@ -879,6 +904,34 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     }
   });
 
+  it('ADVANCE_TO_STEP must set onchain_confirmed so RegisterWorkStep does not reject', async () => {
+    // Scenario: Gateway crashed after submitWork confirmed. On restart,
+    // reconciliation detects work on StudioProxy and returns ADVANCE_TO_STEP.
+    // RegisterWorkStep has a precondition: if (!progress.onchain_confirmed) → FAIL.
+    // This test proves that applyReconciliationResult carries the progress update.
+    (chainState.workSubmissionExists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    chainState.isWorkRegisteredInRewardsDistributor.mockResolvedValue(false);
+
+    const input = createTestInput();
+    const workflow = createWorkSubmissionWorkflow(input);
+    workflow.state = 'RUNNING';
+    workflow.step = 'SUBMIT_WORK_ONCHAIN';
+    workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
+      arweave_tx_id: 'ar-tx-id',
+      arweave_confirmed: true,
+    };
+
+    const result = await reconciler.reconcileWorkSubmission(workflow);
+    expect(result.action).toBe('ADVANCE_TO_STEP');
+
+    const { workflow: updated } = reconciler.applyReconciliationResult(workflow, result);
+
+    expect(updated.step).toBe('REGISTER_WORK');
+    expect((updated.progress as Record<string, unknown>).onchain_confirmed).toBe(true);
+    expect((updated.progress as Record<string, unknown>).onchain_confirmed_at).toBeTypeOf('number');
+  });
+
   it('should handle duplicate registerWork gracefully (idempotent)', async () => {
     // Setup: registerWork tx exists but not confirmed yet
     // Workflow has register_tx_hash already
@@ -890,6 +943,7 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'REGISTER_WORK';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xStudioTx',
@@ -914,6 +968,7 @@ describe('E. REGISTER_WORK step (RewardsDistributor registration)', () => {
     workflow.state = 'RUNNING';
     workflow.step = 'AWAIT_REGISTER_CONFIRM';
     workflow.progress = {
+      ...MOCK_DKG_PROGRESS,
       arweave_tx_id: 'ar-tx-id',
       arweave_confirmed: true,
       onchain_tx_hash: '0xStudioTx',

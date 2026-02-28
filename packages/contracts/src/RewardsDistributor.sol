@@ -147,7 +147,7 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
                     uint8[] memory scores = _decodeScoreVector(validatorScore);
                     
                     workerScoreVectors[validScores] = ScoreVector({
-                        validatorAgentId: 0,
+                        validatorAgentId: studioProxy.getAgentId(validators[j]),
                         dataHash: dataHash,
                         stake: 1 ether,
                         scores: scores,
@@ -322,7 +322,11 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
                 endpoint,
                 string(abi.encodePacked("chaoschain://", _toHexString(dataHash))), // feedbackURI
                 feedbackHash
-            ) {} catch {}
+            ) {} catch Error(string memory reason) {
+                emit GiveFeedbackFailed(agentId, reason);
+            } catch {
+                emit GiveFeedbackFailed(agentId, "");
+            }
         }
     }
     
@@ -603,11 +607,17 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
             errors[i] = errorSquared;
             
             // Weight = e^(-β * error²) (simplified as 1 / (1 + error))
+            // KNOWN LIMITATION: Integer division makes this effectively binary —
+            // weight is 1 when error==0 and 0 otherwise. Validator reward weighting
+            // is currently binary due to integer division; economics revision
+            // scheduled post-DKG integration.
             uint256 weight = PRECISION / (PRECISION + errors[i]);
             totalWeight += weight;
         }
         
-        // Distribute rewards proportional to accuracy
+        // Distribute rewards proportional to accuracy.
+        // See KNOWN LIMITATION above: totalWeight>0 only when all validators
+        // have zero error (perfect consensus agreement).
         for (uint256 i = 0; i < validators.length; i++) {
             if (totalWeight > 0) {
                 uint256 weight = PRECISION / (PRECISION + errors[i]);
@@ -617,24 +627,24 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
                     studioProxy.releaseFunds(validators[i], reward, dataHash);
                     totalDistributed += reward;
                 }
-                
-                // Calculate performance score (0-100) based on accuracy
-                // Performance = e^(-β * error²) scaled to 0-100
-                uint256 performanceScore = (weight * 100) / PRECISION;
-                if (performanceScore > 100) performanceScore = 100;
-                
-                // Publish VA reputation to Reputation Registry (§4.3 protocol_spec_v0.1.md)
-                if (scoreVectors[i].validatorAgentId != 0) {
-                    // Note: In production, feedbackUri would be fetched from validation evidence
-                    // For MVP, we pass empty strings (SDK handles feedback creation)
-                    _publishValidatorReputation(
-                        scoreVectors[i].validatorAgentId,
-                        uint8(performanceScore),
-                        dataHash,
-                        "",           // feedbackUri (would come from SDK/validation evidence)
-                        bytes32(0)    // feedbackHash
-                    );
+            }
+            
+            // Publish VA reputation independently of reward distribution.
+            // Performance score: inverse of normalized error (0-100).
+            // Uses PRECISION² to avoid integer truncation in the weight formula.
+            if (scoreVectors[i].validatorAgentId != 0) {
+                uint256 performanceScore;
+                if (errors[i] == 0) {
+                    performanceScore = 100;
+                } else {
+                    performanceScore = (PRECISION * 100) / (PRECISION + errors[i]);
+                    if (performanceScore > 100) performanceScore = 100;
                 }
+                _publishValidatorReputation(
+                    scoreVectors[i].validatorAgentId,
+                    uint8(performanceScore),
+                    dataHash
+                );
             }
         }
         
@@ -754,9 +764,9 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
                 uint8[] memory scores = abi.decode(scoreVectors[i], (uint8[]));
                 
                 scoreVectorStructs[validCount] = ScoreVector({
-                    validatorAgentId: 0, // Would come from IdentityRegistry
+                    validatorAgentId: studioProxy.getAgentId(validators[i]),
                     dataHash: dataHash,
-                    stake: 1 ether, // Simplified
+                    stake: 1 ether,
                     scores: scores,
                     timestamp: block.timestamp,
                     processed: false
@@ -954,36 +964,29 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
                 feedbackHash
             ) {
                 // Success - reputation published for this dimension
+            } catch Error(string memory reason) {
+                emit GiveFeedbackFailed(workerAgentId, reason);
             } catch {
-                // Failed - likely a mock registry or invalid dimension, continue
+                emit GiveFeedbackFailed(workerAgentId, "");
             }
         }
     }
     
     /**
-     * @notice Publish VA performance scores to Reputation Registry (ERC-8004 Jan 2026 compatible)
+     * @notice Publish VA performance scores to Reputation Registry (ERC-8004 Feb 2026 compatible)
      * @dev Called after consensus to build global verifiable reputation (§4.3 protocol_spec_v0.1.md)
      * 
-     * ERC-8004 Jan 2026 Changes:
-     * - feedbackAuth parameter REMOVED - feedback is now permissionless
-     * - endpoint parameter ADDED
-     * - tags changed from bytes32 to string
-     * 
-     * Triple-Verified Stack Integration:
-     * - feedbackUri contains IntegrityProof (Layer 2: Process Integrity)
-     * - SDK creates this automatically for validators
+     * Mirrors _publishWorkerReputation pattern: constructs a deterministic feedbackURI and
+     * non-zero feedbackHash so the ERC-8004 registry persists the entry.
      * 
      * @param validatorAgentId The validator's agent ID
      * @param performanceScore The performance score (0-100, based on accuracy to consensus)
-     * @param feedbackUri IPFS/Irys URI containing IntegrityProof (from SDK)
-     * @param feedbackHash Hash of feedback content
+     * @param dataHash The work hash used to build deterministic feedbackURI and feedbackHash
      */
     function _publishValidatorReputation(
         uint256 validatorAgentId,
         uint8 performanceScore,
-        bytes32 /* dataHash */,
-        string memory feedbackUri,
-        bytes32 feedbackHash
+        bytes32 dataHash
     ) internal {
         // Get ReputationRegistry from registry
         address reputationRegistry = registry.getReputationRegistry();
@@ -1001,7 +1004,20 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
         string memory tag2 = "CONSENSUS_MATCH";
         string memory endpoint = ""; // Optional endpoint
         
-        // Try to publish feedback with Triple-Verified Stack proofs
+        // Construct deterministic feedbackHash (mirrors worker pattern at line 308)
+        bytes32 feedbackHash = keccak256(abi.encodePacked(
+            dataHash,
+            validatorAgentId,
+            tag1,
+            performanceScore
+        ));
+        
+        // Construct feedbackURI (mirrors worker pattern at line 323)
+        string memory feedbackUri = string(abi.encodePacked(
+            "chaoschain://validator/",
+            _toHexString(dataHash)
+        ));
+        
         // Feb 2026 ABI: value (int128) + valueDecimals (uint8) instead of score
         try IERC8004Reputation(reputationRegistry).giveFeedback(
             validatorAgentId,
@@ -1010,12 +1026,14 @@ contract RewardsDistributor is Ownable, IRewardsDistributor {
             tag1,
             tag2,
             endpoint,
-            feedbackUri,           // Contains IntegrityProof
-            feedbackHash           // Hash of feedback content
+            feedbackUri,
+            feedbackHash
         ) {
-            // Success - reputation published with Triple-Verified Stack proofs
+            // Success
+        } catch Error(string memory reason) {
+            emit GiveFeedbackFailed(validatorAgentId, reason);
         } catch {
-            // Failed - likely a mock registry or other issue
+            emit GiveFeedbackFailed(validatorAgentId, "");
         }
     }
     
